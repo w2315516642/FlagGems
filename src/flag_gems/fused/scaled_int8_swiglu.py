@@ -157,3 +157,25 @@ def scaled_int8_swiglu(input, weight, scale_x, scale_w, *, interleaved=False):
 def scaled_int8_swiglu_interleaved(input, weight, scale_x, scale_w):
     """Same rounding and tiling, with g0,u0,g1,u1 weight/scale channels."""
     return scaled_int8_swiglu(input, weight, scale_x, scale_w, interleaved=True)
+
+
+@libentry()
+@triton.jit
+def _interleaved_swiglu(X, Y, size, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    gate = tl.load(X + 2 * i, i < size, other=0).to(tl.float32)
+    up = tl.load(X + 2 * i + 1, i < size, other=0).to(tl.float32)
+    tl.store(Y + i, (gate * tl.sigmoid(gate)) * up, i < size)
+
+
+def interleaved_swiglu(x):
+    """No materialized deinterleave; preserve BF16 projection then FP32 activation."""
+    if x.ndim < 1 or x.shape[-1] % 2 or not x.is_contiguous():
+        raise ValueError("expected contiguous input with paired last dimension")
+    if x.dtype != torch.bfloat16 or x.device.type == "cpu":
+        raise ValueError("expected BF16 input on an accelerator")
+    y = torch.empty((*x.shape[:-1], x.shape[-1] // 2), device=x.device, dtype=x.dtype)
+    if y.numel():
+        with torch_device_fn.device(x.device):
+            _interleaved_swiglu[(triton.cdiv(y.numel(), 256),)](x, y, y.numel(), 256)
+    return y

@@ -87,7 +87,7 @@ from flag_gems.fused.scaled_int8_swiglu import (
     scaled_int8_swiglu,
     scaled_int8_swiglu_interleaved,
 )
-from flag_gems.fused.interleaved_swiglu import interleaved_swiglu
+from flag_gems.fused.scaled_int8_swiglu import interleaved_swiglu
 from flag_gems.fused.matmul_bias_activation import matmul_bias_activation
 from flag_gems.fused.matmuladd import matmuladd
 from flag_gems.fused.mhc import (
