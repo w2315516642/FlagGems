@@ -204,8 +204,84 @@ def mm_kernel(
         tl.atomic_add(C, acc, mask=mask)
 
 
+def _tuned_bf16_config(M, N, K):
+    if (K, N) == (2048, 2048):
+        if 1 <= M <= 16:
+            return (16, 128, 64, 4, 1, 4, False)
+        if 256 < M <= 1024:
+            return (128, 128, 64, 8, 1, 1, True)
+    elif (K, N) == (6144, 2048):
+        if 1 <= M <= 16:
+            return (16, 128, 64, 4, 1, 4, False)
+        if 128 < M <= 1024:
+            return (128, 128, 64, 8, 2, 1, True)
+    return None
+
+
+def _try_tuned_bf16(a, b, c, M, N, K):
+    # Tune only validated dense shapes within the same backend entry.
+    # No model name, layer index, registered operator or priority is changed.
+    if not (
+        a.dtype == b.dtype == c.dtype == torch.bfloat16
+        and a.is_cuda
+        and a.device == b.device == c.device
+        and a.is_contiguous()
+        and b.stride() == (1, K)
+        and c.is_contiguous()
+        and c.shape == (M, N)
+    ):
+        return False
+    cfg = _tuned_bf16_config(M, N, K)
+    if cfg is None:
+        return False
+    from ._mm_bf16_tuned import mm_kernel as _tuned_mm_kernel, reduce_fp32 as _reduce
+
+    bm, bn, bk, nw, ns, sp, grouped = cfg
+    partial = (
+        torch.empty((sp, M, N), device=a.device, dtype=torch.float32) if sp > 1 else c
+    )
+    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), sp)
+    with torch_device_fn.device(a.device):
+        _tuned_mm_kernel[grid](
+            a,
+            b,
+            partial,
+            M,
+            N,
+            K,
+            *a.stride(),
+            *b.stride(),
+            N,
+            1,
+            tl.float32,
+            None,
+            True,
+            bm,
+            bn,
+            bk,
+            8,
+            sp,
+            True,
+            tl.bfloat16,
+            False,
+            False,
+            False,
+            False,
+            grouped,
+            num_warps=nw,
+            num_stages=ns,
+        )
+        if sp > 1:
+            _reduce[(triton.cdiv(M * N, 256),)](partial, c, M, N, sp, 256, num_warps=4)
+    return True
+
+
 def _launch_mm(a, b, c, M, N, K):
     """Launch Triton matmul _kernel; c must be pre-allocated."""
+    if M == 0 or N == 0:
+        return c
+    if _try_tuned_bf16(a, b, c, M, N, K):
+        return c
     ab_dtype = get_higher_dtype(a.dtype, b.dtype)
     acc_dtype_tl = tl.float32
     ab_dtype_tl = _to_tl_type(ab_dtype)
