@@ -72,6 +72,11 @@ from flag_gems.fused.gelu_and_mul import gelu_and_mul
 from flag_gems.fused.grouped_topk import grouped_topk
 from flag_gems.fused.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flag_gems.fused.instance_norm import instance_norm
+from flag_gems.fused.int8_linear import (
+    dynamic_int8_linear,
+    quantize_int8_tokens,
+    scaled_int8_linear,
+)
 from flag_gems.fused.linear_swiglu import linear_swiglu
 from flag_gems.fused.scaled_int8_swiglu import (
     scaled_int8_swiglu,
@@ -169,6 +174,9 @@ __all__ = [
     "inplace_fused_experts",
     "instance_norm",
     "invoke_fused_moe_triton_kernel",
+    "dynamic_int8_linear",
+    "quantize_int8_tokens",
+    "scaled_int8_linear",
     "linear_swiglu",
     "scaled_int8_swiglu",
     "scaled_int8_swiglu_interleaved",
