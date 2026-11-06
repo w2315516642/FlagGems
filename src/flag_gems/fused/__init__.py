@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flag_gems.fused.topk_topp import (
+    clear_topk_topp_cache,
+    supports_topk_topp,
+    topk_topp_filter,
+)
 from flag_gems.fused.act_quant import act_quant_triton
 from flag_gems.fused.add_rms_norm import add_rms_norm
 from flag_gems.fused.apply_repetition_penalties import apply_repetition_penalties
@@ -177,6 +182,9 @@ __all__ = [
     "dynamic_int8_linear",
     "quantize_int8_tokens",
     "scaled_int8_linear",
+    "clear_topk_topp_cache",
+    "supports_topk_topp",
+    "topk_topp_filter",
     "linear_swiglu",
     "scaled_int8_swiglu",
     "scaled_int8_swiglu_interleaved",
