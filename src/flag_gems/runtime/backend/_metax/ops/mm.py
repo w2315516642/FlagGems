@@ -660,6 +660,7 @@ def _prune_mm_splitk_two_step_configs(configs, named_args, **kwargs):
 @libtuner(
     configs=runtime.get_tuned_config("mm_splitk"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
+    strategy=["align32", "default", "default", "default", "default"],
     pre_hook=_reset_splitk_output,
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_splitk",

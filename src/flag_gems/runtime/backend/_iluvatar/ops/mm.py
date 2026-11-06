@@ -51,6 +51,7 @@ def _to_tl_type(ty):
 @libtuner(
     configs=runtime.get_tuned_config("mm"),
     key=["M", "N", "K"],
+    strategy=["align32", "default", "default"],
     prune_configs_by={
         "early_config_prune": early_config_prune,
         "perf_model": estimate_matmul_time,
