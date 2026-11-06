@@ -12,7 +12,7 @@ import triton
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 
-from ._dynamic_int8 import gate_pad_quant_kernel, tagged_quant_kernel
+from ._int8_kernels import gate_pad_quant_kernel, tagged_quant_kernel
 
 
 def quantize_int8_tokens(x, *, padded_rows=None, num_warps=8):
@@ -129,24 +129,27 @@ def scaled_int8_linear(q, weight, scale_x, scale_w, *, kind="qkv"):
         return torch.empty((m, n), device=q.device, dtype=torch.bfloat16)
     with torch_device_fn.device(q.device):
         if kind == "down":
-            from ._int8_down import launch
+            from ._int8_kernels import launch_down as launch
 
             return launch(q, weight, scale_x, scale_w, _down_config(m), False)
         if kind == "o":
-            from ._int8_o import launch
+            from ._int8_kernels import launch_o as launch
 
             return launch(q, weight, scale_x, scale_w, _qkv_config(m, k), False)
         if kind == "qkv":
             if vendor == "iluvatar" and 17 <= m <= 64 and k == 2048 and n == 2560:
                 return _iluvatar_small_qkv(q, weight, scale_x, scale_w)
-            from ._int8_qkv import launch
+            from ._int8_kernels import launch_qkv as launch
 
             return launch(q, weight, scale_x, scale_w, _qkv_config(m, k), False)
         return _iluvatar_gate(q, weight, scale_x, scale_w)
 
 
 def _iluvatar_small_qkv(q, weight, sx, sw):
-    from ._int8_iluvatar import down_kernel, reduce_kernel
+    from ._int8_kernels import (
+        iluvatar_kernel as down_kernel,
+        iluvatar_reduce_kernel as reduce_kernel,
+    )
 
     m, k = q.shape
     n = weight.shape[1]
@@ -189,8 +192,8 @@ def _iluvatar_small_qkv(q, weight, sx, sw):
 
 
 def _iluvatar_gate(q, weight, sx, sw):
-    from ._int8_gate import gate_int8_kernel
-    from ._int8_iluvatar import down_kernel
+    from ._int8_kernels import gate_int8_kernel
+    from ._int8_kernels import iluvatar_kernel as down_kernel
 
     m, k = q.shape
     n = weight.shape[1]
