@@ -75,7 +75,9 @@ def test_invalid_projection_contracts_rejected(validate, bad):
         elif bad == "input_stride":
             q = torch.empty_strided((5, 128), (256, 2), device="cuda", dtype=torch.int8)
         elif bad == "device":
-            sw = torch.empty(256, device="cuda:1")
+            # FakeTensor may initialize the requested GPU context on Torch
+            # 2.10. A CPU scale tests the same mismatch on single-GPU hosts.
+            sw = torch.empty(256, device="cpu")
         with pytest.raises(ValueError):
             validate(q, w, sx, sw)
 
