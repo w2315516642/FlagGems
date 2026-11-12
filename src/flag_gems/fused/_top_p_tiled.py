@@ -5,6 +5,8 @@ import torch
 import triton as tr
 import triton.language as tl
 
+from flag_gems import runtime
+
 
 from collections import OrderedDict
 import threading
@@ -17,7 +19,16 @@ from ._topk_topp import (
 
 
 @tr.jit
-def initial_part(X, PART, V: tl.constexpr, T: tl.constexpr, B: tl.constexpr):
+def initial_part(
+    X,
+    PART,
+    V: tl.constexpr,
+    T: tl.constexpr,
+    B: tl.constexpr,
+    INDIRECT: tl.constexpr = False,
+):
+    if INDIRECT:
+        X = tl.load(X).to(tl.pointer_type(tl.float32))
     row = tl.program_id(0)
     tile = tl.program_id(1)
     j = tile * B + tl.arange(0, B)
@@ -52,7 +63,11 @@ def initial_row(PART, P, STATE, T: tl.constexpr, BT: tl.constexpr):
 
 
 @tr.jit
-def weights_kernel(X, W, STATE, V: tl.constexpr, B: tl.constexpr):
+def weights_kernel(
+    X, W, STATE, V: tl.constexpr, B: tl.constexpr, INDIRECT: tl.constexpr = False
+):
+    if INDIRECT:
+        X = tl.load(X).to(tl.pointer_type(tl.float32))
     row = tl.program_id(0)
     j = tl.program_id(1) * B + tl.arange(0, B)
     x = tl.load(X + row * V + j, j < V, -float("inf"))
@@ -140,8 +155,20 @@ def final_row(
 
 @tr.jit
 def apply_mask(
-    X, W, STATE, PREFIX, KEEP, Y, V: tl.constexpr, T: tl.constexpr, B: tl.constexpr
+    X,
+    W,
+    STATE,
+    PREFIX,
+    KEEP,
+    Y,
+    V: tl.constexpr,
+    T: tl.constexpr,
+    B: tl.constexpr,
+    INDIRECT: tl.constexpr = False,
 ):
+    if INDIRECT:
+        X = tl.load(X).to(tl.pointer_type(tl.float32))
+        Y = tl.load(Y + 1).to(tl.pointer_type(tl.float32))
     row = tl.program_id(0)
     tile = tl.program_id(1)
     j = tile * B + tl.arange(0, B)
@@ -167,7 +194,7 @@ _MAX_CACHE_ENTRIES = 8
 
 
 class _Workspace:
-    def __init__(self, logits, iterations=32, rows=None):
+    def __init__(self, logits, iterations=32, rows=None, *, indirect=None):
         self.m = logits.shape[0] if rows is None else rows
         self.v = logits.shape[1]
         self.b = 4096
@@ -187,6 +214,12 @@ class _Workspace:
         self.buffer = torch.empty_like(self.x)
         self.normal_table = logits.new_tensor(_NORMAL_CDF_TO_SIGMA_TABLE)
         self.percentile_table = logits.new_tensor(_PERCENTILE_TO_STD_TABLE)
+        # Enable external graph I/O only on the validated target. Other
+        # vendors keep scratch I/O until their device regression is complete.
+        self.indirect = (
+            (runtime.device.vendor_name == "iluvatar") if indirect is None else indirect
+        )
+        self.io = torch.empty(2, dtype=torch.int64, device=logits.device)
         self.graph = None
         self.done = torch.cuda.Event()
         self.nbytes = sum(
@@ -198,9 +231,13 @@ class _Workspace:
     def kernels(self):
         m, v, b, t = self.m, self.v, self.b, self.t
         grid, bt = (m, t), tr.next_power_of_2(t)
-        initial_part[grid](self.x, self.part, v, t, b, num_warps=4)
+        x = self.io if self.indirect else self.x
+        y = self.io if self.indirect else self.y
+        initial_part[grid](x, self.part, v, t, b, INDIRECT=self.indirect, num_warps=4)
         initial_row[(m,)](self.part, self.p, self.state, t, bt, num_warps=4)
-        weights_kernel[grid](self.x, self.w, self.state, v, b, num_warps=4)
+        weights_kernel[grid](
+            x, self.w, self.state, v, b, INDIRECT=self.indirect, num_warps=4
+        )
         for it in range(self.iterations):
             scan_part[grid](self.w, self.state, self.part, v, t, b, num_warps=4)
             update_row[(m,)](self.part, self.state, t, bt, it, num_warps=4)
@@ -217,21 +254,22 @@ class _Workspace:
             num_warps=4,
         )
         apply_mask[grid](
-            self.x,
+            x,
             self.w,
             self.state,
             self.prefix,
             self.keep,
-            self.y,
+            y,
             v,
             t,
             b,
+            INDIRECT=self.indirect,
             num_warps=4,
         )
         # Completed rows use p=1 and skip V5 search/masking. Unresolved rows
         # retain original logits and their original p, all without a CPU read.
         _topk_topp_kernel[(m,)](
-            self.y,
+            y,
             v,
             self.buffer,
             self.percentile_table,
@@ -245,18 +283,37 @@ class _Workspace:
             BLOCK_SIZE_TRUNC=4096,
             TOPK_ENABLED=False,
             TOPP_ENABLED=True,
+            LOGITS_INDIRECT=self.indirect,
         )
 
-    def copy_inputs(self, logits, p):
+    def copy_inputs(self, logits, p, *, external=True):
         rows = logits.shape[0]
-        self.x[:rows].copy_(logits)
+        direct = self.indirect and external and rows == self.m
+        if not direct:
+            self.x[:rows].copy_(logits)
+        if self.indirect:
+            source, target = (logits, logits) if direct else (self.x, self.y)
+            # A fresh pinned allocation avoids overwriting a host table while
+            # its earlier asynchronous DMA may still be pending. PyTorch's
+            # pinned allocator retains the allocation until the copy completes.
+            addresses = torch.tensor(
+                [source.data_ptr(), target.data_ptr()],
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            self.io.copy_(addresses, non_blocking=True)
+            if direct:
+                logits.record_stream(torch.cuda.current_stream(logits.device))
         # The padded rows are never returned. Reset their p even after a prior
         # call used more rows from this bucket, so they cannot run fallback.
         self.p.fill_(1.0)
         self.p[:rows].copy_(p)
+        return direct
 
     def capture(self, logits, p):
-        self.copy_inputs(logits, p)
+        # Warmup/capture must never filter caller storage before apply().
+        self.copy_inputs(logits, p, external=False)
         current = torch.cuda.current_stream(logits.device)
         stream = torch.cuda.Stream(device=logits.device)
         stream.wait_stream(current)
@@ -269,11 +326,12 @@ class _Workspace:
         current.wait_stream(stream)
 
     def apply(self, logits, p):
-        self.copy_inputs(logits, p)
+        direct = self.copy_inputs(logits, p)
         self.graph.replay()
-        # Preserve the original filter's in-place contract; no caller retains
-        # a view into reusable graph output storage.
-        logits.copy_(self.y[: logits.shape[0]])
+        # Full-capacity rows read/write the caller through the parameter table.
+        # Partial buckets retain padded scratch and the existing copy contract.
+        if not direct:
+            logits.copy_(self.y[: logits.shape[0]])
         self.done.record()
         return logits
 

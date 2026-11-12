@@ -112,7 +112,11 @@ def _topk_topp_kernel(
     BLOCK_SIZE_TRUNC: tl.constexpr,
     TOPK_ENABLED: tl.constexpr,
     TOPP_ENABLED: tl.constexpr,
+    LOGITS_INDIRECT: tl.constexpr = False,
 ):
+    if LOGITS_INDIRECT:
+        # Used only by the tiled filter's graph-owned external-output table.
+        LOGITS = tl.load(LOGITS + 1).to(tl.pointer_type(tl.float32))
     NUM_TILES: tl.constexpr = (VOCAB_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)

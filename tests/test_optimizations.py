@@ -108,8 +108,11 @@ def test_top_p_mass_order_and_workspace_input_updates(m):
     x = torch.randn(m, 8192, device="cuda", dtype=torch.float32)
     p = torch.full((m,), 0.95, device="cuda", dtype=torch.float32)
     try:
-        for multiplier in [1.0, -1.0, 0.5]:
-            logits = x * multiplier
+        sizes = [m, 33, 64, 49, 64] if m == 64 else [3, 4, 3]
+        bank = torch.randn(max(sizes), 8192, device="cuda", dtype=torch.float32)
+        for rows, multiplier in zip(sizes, [1.0, -1.0, 0.5, 2.0, 0.25]):
+            logits = bank[:rows] * multiplier
+            p = torch.full((rows,), 0.95, device="cuda", dtype=torch.float32)
             before = logits.cpu().clone()
             output = flag_gems.topk_topp_filter(logits, None, p)
             assert output.data_ptr() == logits.data_ptr()
@@ -313,3 +316,32 @@ def test_ties_round_to_even(with_residual):
         atol=0,
     )
     torch.testing.assert_close(scale.cpu(), torch.ones(1, 1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_padded_residual_norm_quant_boundary(dtype):
+    x = torch.randn(17, 256, device="cuda", dtype=dtype)
+    r = torch.randn_like(x)
+    w = torch.randn(256, device="cuda", dtype=dtype)
+    q, scale, residual = flag_gems.add_rms_norm_quantize_int8(x, r, w, padded_rows=32)
+    combined = x.cpu().double() + r.cpu().double()
+    normalized = (
+        (
+            combined
+            * torch.rsqrt(combined.square().mean(-1, keepdim=True) + 1e-6)
+            * w.cpu().double()
+        )
+        .to(dtype)
+        .float()
+    )
+    amax = normalized.abs().amax(-1, keepdim=True)
+    expected_scale = amax / 127.0
+    expected_codes = (
+        (normalized * torch.where(amax > 0, 127.0 / amax, 0.0)).round().clamp(-128, 127)
+    )
+    assert q.shape == (32, 256) and scale.shape == (32, 1)
+    assert torch.equal(residual.cpu(), combined.to(dtype))
+    assert (q[:17].cpu().float() - expected_codes).abs().max() <= 1
+    torch.testing.assert_close(scale[:17].cpu(), expected_scale, rtol=0.008, atol=1e-8)
+    assert torch.count_nonzero(q[17:]) == torch.count_nonzero(scale[17:]) == 0

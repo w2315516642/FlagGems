@@ -15,6 +15,7 @@ import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
+from flag_gems.utils import tl_extra_shim
 
 
 @triton.jit
@@ -109,5 +110,81 @@ def rms_norm_dynamic_int8(x, weight, eps=1e-6, residual=None):
                 residual is not None,
                 triton.next_power_of_2(x.shape[1]),
                 num_warps=4 if x.shape[1] <= 2048 else 8,
+            )
+    return q, scale, residual_out
+
+
+@triton.jit
+def _add_rms_norm_quantize_kernel(
+    X, R, W, Q, S, R_OUT, M, N: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0) + tl.arange(0, 1)
+    # Preserve the two-element reduction layout of the BF16 norm boundary;
+    # INT8 stores must not select a different sum tree through wider vectors.
+    col = tl.max_contiguous(tl.arange(0, BLOCK), 2)
+    mask = (row[:, None] < M) & (col[None, :] < N)
+    value = tl.load(X + row[:, None] * N + col[None, :], mask, 0).to(tl.float32)
+    value += tl.load(R + row[:, None] * N + col[None, :], mask, 0).to(tl.float32)
+    tl.store(R_OUT + row[:, None] * N + col[None, :], value, mask)
+    weight = tl.load(W + col, col < N, 0).to(tl.float32)
+    variance = tl.sum(value * value, 1) / N
+    normalized = value * tl_extra_shim.rsqrt(variance[:, None] + EPS)
+    rounded = (normalized * weight[None, :]).to(X.dtype.element_ty).to(tl.float32)
+    amax = tl.max(tl.abs(rounded), 1)
+    inverse = tl.where(amax != 0, 127.0 / amax, 0.0)
+    codes = tl_extra_shim.nearbyint(rounded * inverse[:, None])
+    codes = tl.minimum(tl.maximum(codes, -128.0), 127.0)
+    tl.store(Q + row[:, None] * N + col[None, :], codes.to(tl.int8), col[None, :] < N)
+    tl.store(S + row, amax / 127.0)
+
+
+def add_rms_norm_quantize_int8(x, residual, weight, eps=1e-6, *, padded_rows=None):
+    """Residual RMSNorm -> rounded BF16/FP16 -> per-token INT8, without mutation.
+
+    Return padded codes/scales and the input-dtype residual. Callers must
+    require this materialized residual boundary; consumers relying on a deferred
+    higher-precision residual expression cannot use this new fused operation.
+    Padded rows contain zero codes and scales. Existing Norm APIs stay unchanged.
+    """
+    if x.ndim != 2 or not 0 < x.shape[1] <= 8192:
+        raise ValueError("expected [tokens, hidden], hidden in [1,8192]")
+    if x.device.type != "cuda" or x.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("expected an accelerator BF16/FP16 input")
+    if (
+        residual.shape != x.shape
+        or residual.dtype != x.dtype
+        or residual.device != x.device
+    ):
+        raise ValueError("residual must match input shape, dtype and device")
+    if (
+        weight.shape != (x.shape[1],)
+        or weight.dtype != x.dtype
+        or weight.device != x.device
+    ):
+        raise ValueError("weight must match input hidden size, dtype and device")
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("eps must be finite and positive")
+    rows = x.shape[0] if padded_rows is None else padded_rows
+    if type(rows) is not int or rows < x.shape[0]:
+        raise ValueError("padded_rows must be an integer at least tokens")
+    x, residual, weight = x.contiguous(), residual.contiguous(), weight.contiguous()
+    q = torch.empty((rows, x.shape[1]), dtype=torch.int8, device=x.device)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+    residual_out = torch.empty_like(x)
+    if rows:
+        with torch_device_fn.device(x.device):
+            _add_rms_norm_quantize_kernel[(rows,)](
+                x,
+                residual,
+                weight,
+                q,
+                scale,
+                residual_out,
+                x.shape[0],
+                x.shape[1],
+                eps,
+                triton.next_power_of_2(x.shape[1]),
+                num_warps=4 if x.shape[1] <= 2048 else 8,
+                num_stages=1,
             )
     return q, scale, residual_out
