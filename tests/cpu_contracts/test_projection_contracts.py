@@ -141,3 +141,30 @@ def test_bf16_down_and_o_ranges_do_not_extend_to_other_shapes():
     assert select(257, 2048, 2048)[4:6] == (1, 1)
     for m in [1, 16, 129, 257, 1024]:
         assert select(m, 4096, 6144) is None
+
+
+@pytest.mark.parametrize(
+    "block_m,stages,expected", [(1, 2, 1), (4, 2, 1), (8, 3, 1), (16, 2, 2), (32, 3, 3)]
+)
+def test_iluvatar_small_block_m_linear_single_stage(block_m, stages, expected):
+    path = ROOT / "src/flag_gems/runtime/backend/_iluvatar/ops/linear.py"
+    tree = ast.parse(path.read_text())
+    kernel = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "linear_kernel"
+    )
+    heuristic = next(
+        d
+        for d in kernel.decorator_list
+        if isinstance(d, ast.Call)
+        and isinstance(d.func, ast.Attribute)
+        and d.func.attr == "heuristics"
+    )
+    rule = next(
+        v
+        for k, v in zip(heuristic.args[0].keys, heuristic.args[0].values)
+        if isinstance(k, ast.Constant) and k.value == "num_stages"
+    )
+    select = eval(compile(ast.Expression(rule), str(path), "eval"))
+    assert select({"BLOCK_M": block_m, "num_stages": stages}) == expected

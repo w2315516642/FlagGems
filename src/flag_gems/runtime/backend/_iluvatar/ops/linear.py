@@ -33,7 +33,13 @@ logger = logging.getLogger(__name__)
     warmup=5,
     rep=10,
 )
-@triton.heuristics(runtime.get_heuristic_config("linear"))
+@triton.heuristics(
+    {
+        **runtime.get_heuristic_config("linear"),
+        # BI-V150: small-M multi-stage codegen produces unstable GEMM values.
+        "num_stages": lambda args: 1 if args["BLOCK_M"] <= 8 else args["num_stages"],
+    }
+)
 @triton.jit
 def linear_kernel(
     input_ptr,
