@@ -146,16 +146,13 @@ def scaled_int8_linear(q, weight, scale_x, scale_w, *, kind="qkv"):
 
 
 def _iluvatar_small_qkv(q, weight, sx, sw):
-    from ._int8_kernels import (
-        iluvatar_kernel as down_kernel,
-        iluvatar_reduce_kernel as reduce_kernel,
-    )
+    from ._int8_kernels import iluvatar_kernel, iluvatar_reduce_kernel
 
     m, k = q.shape
     n = weight.shape[1]
     y = torch.empty((m, n), device=q.device, dtype=torch.bfloat16)
     partial = torch.empty((4, m, n), device=q.device, dtype=torch.int32)
-    down_kernel[(triton.cdiv(m, 32) * triton.cdiv(n, 128), 4)](
+    iluvatar_kernel[(triton.cdiv(m, 32) * triton.cdiv(n, 128), 4)](
         q,
         weight,
         sx,
@@ -176,7 +173,7 @@ def _iluvatar_small_qkv(q, weight, sx, sw):
         num_warps=4,
         num_stages=1,
     )
-    reduce_kernel[(triton.cdiv(m * n, 256),)](
+    iluvatar_reduce_kernel[(triton.cdiv(m * n, 256),)](
         partial,
         sx,
         sw,
@@ -192,56 +189,35 @@ def _iluvatar_small_qkv(q, weight, sx, sw):
 
 
 def _iluvatar_gate(q, weight, sx, sw):
-    from ._int8_kernels import gate_int8_kernel
-    from ._int8_kernels import iluvatar_kernel as down_kernel
+    from ._int8_kernels import gate_int8_kernel, iluvatar_kernel
 
     m, k = q.shape
     n = weight.shape[1]
     y = torch.empty((m, n), device=q.device, dtype=torch.bfloat16)
-    if m <= 32 and k == 2048 and n == 12288:
-        down_kernel[(triton.cdiv(m, 32) * triton.cdiv(n, 128), 1)](
-            q,
-            weight,
-            sx,
-            sw,
-            y,
-            y,
-            m,
-            n,
-            k,
-            32,
-            128,
-            128,
-            1,
-            False,
-            1,
-            4,
-            0,
-            num_warps=4,
-            num_stages=1,
-        )
-    else:
-        gate_int8_kernel[(triton.cdiv(m, 128) * triton.cdiv(n, 256), 1)](
-            q,
-            weight,
-            sx,
-            sw,
-            y,
-            y,
-            m,
-            n,
-            k,
-            128,
-            256,
-            64,
-            1,
-            False,
-            1,
-            8,
-            8,
-            num_warps=8,
-            num_stages=1,
-        )
+    small = m <= 32 and k == 2048 and n == 12288
+    kernel = iluvatar_kernel if small else gate_int8_kernel
+    bm, bn, bk, warps, group_m = (32, 128, 128, 4, 0) if small else (128, 256, 64, 8, 8)
+    kernel[(triton.cdiv(m, bm) * triton.cdiv(n, bn), 1)](
+        q,
+        weight,
+        sx,
+        sw,
+        y,
+        y,
+        m,
+        n,
+        k,
+        bm,
+        bn,
+        bk,
+        1,
+        False,
+        1,
+        warps,
+        group_m,
+        num_warps=warps,
+        num_stages=1,
+    )
     return y
 
 
